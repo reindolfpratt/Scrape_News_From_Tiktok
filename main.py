@@ -11,14 +11,14 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-APIFY_API_KEY = "apify_api_AswiEHAqdyb2kNbVxMB9irJRdNxeZe427Hvj"
-PERPLEXITY_API_KEY = "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"
-APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbynrnvYTQ_DAklI6gSZCJf7Qa7Z-gHaT63dRo0c3mxy_U3o5i892-rZKxBjd5SzZBwh/exec"
+APIFY_API_KEY = os.environ["APIFY_API_KEY"]
+PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
+APPS_SCRIPT_URL = os.environ["APPS_SCRIPT_URL"]
 
 cloudinary.config(
-    cloud_name="dnlqngkq1",
-    api_key="345298898259986",
-    api_secret="MHp6ce9pKezuVLk7NmYn8zRtmW4"
+    cloud_name=os.environ["CLOUDINARY_CLOUD_NAME"],
+    api_key=os.environ["CLOUDINARY_API_KEY"],
+    api_secret=os.environ["CLOUDINARY_API_SECRET"]
 )
 
 TRUSTED_ACCOUNTS = [
