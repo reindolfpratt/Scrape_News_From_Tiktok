@@ -168,7 +168,7 @@ def get_immigration_news(used_headlines=None):
                 )
             }
         ]
-    }Amazing. We are making very good headways. Thank you. Now I want it to prioritize Official Channels and only fall back to the most viewed channel if the official channel doesn't have it. So if there is a topic that it's working on, is your first search there.
+    }
 
     r = requests.post(
         "https://api.perplexity.ai/chat/completions",
