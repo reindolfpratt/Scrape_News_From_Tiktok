@@ -142,9 +142,14 @@ def get_immigration_news(used_headlines=None):
             {
                 "role": "user",
                 "content": (
-                    "What is the single most important news story from the last 20 days regarding "
-                    "international university studies (for international students) or immigration policy "
-                    "in the UK, Canada, USA, Australia, or Europe? "
+                    "What is the single most important official news story or policy announcement from the last 20 days "
+                    "regarding international university studies or immigration in the UK, Canada, USA, Australia, "
+                    "or across Europe?\n\n"
+                    "FOCUS: Prioritize official government announcements, visa policy changes, and major academic updates. "
+                    "Always report accurate facts, even if they include restrictions but official news. "
+                    "CRITICAL: Avoid any 'negative opinion' stories, vlogs, or content where individuals are simply sharing "
+                    "personal bad experiences to discourage others from applying. We want to be encouraging, "
+                    "informative news source for students and immigrants.\n\n"
                     "Reply in exactly this format and nothing else:\n"
                     "HEADLINE: <headline>\n"
                     "SUMMARY: <two sentence summary>\n"
