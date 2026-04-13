@@ -118,20 +118,70 @@ def resolve_short_url(url: str) -> str:
 
 def is_immigration_related(text: str) -> bool:
     """
-    Basic relevance filter — ensures we don't grab an off-topic video
-    from an account that occasionally posts non-immigration content.
+    Fast first-pass keyword filter — removes obviously off-topic videos
+    before spending a DeepSeek API call on them. Only use unambiguous,
+    immigration-specific terms here. Generic words like 'canada' or 'border'
+    are excluded because they appear in war/politics news too.
     """
     keywords = {
-        "visa", "immigration", "immigrant", "migrants", "border",
-        "passport", "citizenship", "asylum", "refugee", "work permit",
-        "study permit", "student visa", "pr", "permanent resident",
-        "deportation", "ircc", "uscis", "home office", "uk visa",
-        "canada", "express entry", "points based", "settlement",
-        "skilled worker", "tier", "biometric", "eea", "brexit",
-        "right to remain", "leave to remain", "sponsorship", "iom",
+        "visa", "immigration", "immigrant", "immigrants", "migrants", "migrant",
+        "passport", "citizenship", "asylum", "refugee", "refugees",
+        "work permit", "study permit", "student visa", "permanent resident",
+        "deportation", "deported", "ircc", "uscis", "home office", "uk visa",
+        "express entry", "points based", "skilled worker",
+        "biometric residence", "eea", "leave to remain", "right to remain",
+        "sponsorship licence", "tier 2", "tier 4", "global talent",
+        "naturalisation", "indefinite leave", "immigration lawyer",
+        "immigration attorney", "green card", "work authorization",
+        "entry clearance", "immigration court", "removal order",
+        "travel ban", "visa ban", "immigration ban",
     }
     text_lower = text.lower()
     return any(kw in text_lower for kw in keywords)
+
+
+def is_immigration_related_ai(description: str) -> bool:
+    """
+    Second-pass AI gate — asks DeepSeek to confirm the video is
+    genuinely about immigration/visas before we accept it.
+    Returns True only if DeepSeek answers YES.
+    Falls back to True on API errors (to avoid blocking on outage).
+    """
+    if not description or not description.strip():
+        return False
+    try:
+        headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        prompt = (
+            f"You are a content classifier for an immigration news account. "
+            f"Read the following TikTok video description and answer with ONE word only: "
+            f"YES if the video is specifically about immigration, visas, work permits, "
+            f"student visas, citizenship, deportation, or related immigration topics. "
+            f"Answer NO if it is about war, crime, politics unrelated to immigration, "
+            f"sports, entertainment, or any other topic.\n\n"
+            f"Description: \"{description[:500]}\""
+        )
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 5,
+            "temperature": 0.0,
+        }
+        r = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+        r.raise_for_status()
+        answer = r.json()["choices"][0]["message"]["content"].strip().upper()
+        print(f"[AI GATE] DeepSeek says: {answer} | {description[:60]}")
+        return answer.startswith("YES")
+    except Exception as e:
+        print(f"[WARN] AI gate failed ({e}), falling back to keyword filter result")
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -199,10 +249,15 @@ def pick_video(all_videos: List[dict], seen_ids: set, seen_urls: set) -> Optiona
         if url in seen_urls or vid in seen_ids:
             continue
 
-        # Skip videos unrelated to immigration
+        # Layer 1: Fast keyword pre-filter (free, no API call)
         description = video.get("text", "") or ""
         if not is_immigration_related(description):
-            print(f"[SKIP] Not immigration-related: {description[:80]}")
+            print(f"[SKIP] Keyword filter rejected: {description[:80]}")
+            continue
+
+        # Layer 2: DeepSeek AI gate (strict YES/NO classification)
+        if not is_immigration_related_ai(description):
+            print(f"[SKIP] AI gate rejected: {description[:80]}")
             continue
 
         candidates.append(video)
