@@ -91,6 +91,7 @@ IMMIGRATION_ACCOUNTS = [
 class RunRequest(BaseModel):
     seen_ids: Optional[List[str]] = []
     seen_urls: Optional[List[str]] = []
+    recent_summaries: Optional[List[str]] = []  # Last 20 posted descriptions for topic dedup
 
 
 # ---------------------------------------------------------------------------
@@ -118,22 +119,34 @@ def resolve_short_url(url: str) -> str:
 
 def is_immigration_related(text: str) -> bool:
     """
-    Fast first-pass keyword filter — removes obviously off-topic videos
-    before spending a DeepSeek API call on them. Only use unambiguous,
-    immigration-specific terms here. Generic words like 'canada' or 'border'
-    are excluded because they appear in war/politics news too.
+    Fast first-pass keyword filter — removes obvious junk (sports, war, entertainment)
+    before spending a DeepSeek API call. Intentionally broad so we don't miss
+    anything legitimate. DeepSeek is the real final judge.
     """
     keywords = {
-        "visa", "immigration", "immigrant", "immigrants", "migrants", "migrant",
-        "passport", "citizenship", "asylum", "refugee", "refugees",
-        "work permit", "study permit", "student visa", "permanent resident",
-        "deportation", "deported", "ircc", "uscis", "home office", "uk visa",
-        "express entry", "points based", "skilled worker",
-        "biometric residence", "eea", "leave to remain", "right to remain",
-        "sponsorship licence", "tier 2", "tier 4", "global talent",
-        "naturalisation", "indefinite leave", "immigration lawyer",
-        "immigration attorney", "green card", "work authorization",
-        "entry clearance", "immigration court", "removal order",
+        # Core immigration terms
+        "visa", "immigration", "immigrant", "immigrants", "immigrate",
+        "migrants", "migrant", "migration",
+        # Students
+        "international student", "international students", "student visa",
+        "study abroad", "study permit", "studying abroad",
+        "student permit", "overseas student", "foreign student",
+        # Nationality & citizenship
+        "passport", "citizenship", "naturalisation", "naturalization",
+        "permanent resident", "pr status", "green card",
+        # Protection
+        "asylum", "refugee", "refugees", "deportation", "deported", "removal order",
+        # Work
+        "work permit", "work visa", "skilled worker", "work authorization",
+        "sponsorship", "sponsored", "sponsor", "employer sponsor",
+        # Country-specific official terms
+        "ircc", "uscis", "home office", "uk visa",
+        "express entry", "points based", "global talent",
+        "tier 2", "tier 4", "leave to remain", "right to remain",
+        "biometric residence", "indefinite leave", "entry clearance",
+        "eea", "brp", "settlement",
+        # Legal
+        "immigration lawyer", "immigration attorney", "immigration court",
         "travel ban", "visa ban", "immigration ban",
     }
     text_lower = text.lower()
@@ -142,10 +155,10 @@ def is_immigration_related(text: str) -> bool:
 
 def is_immigration_related_ai(description: str) -> bool:
     """
-    Second-pass AI gate — asks DeepSeek to confirm the video is
-    genuinely about immigration/visas before we accept it.
+    Second-pass AI gate — asks DeepSeek to confirm the video is genuinely
+    about immigration, visas, or international students before we accept it.
     Returns True only if DeepSeek answers YES.
-    Falls back to True on API errors (to avoid blocking on outage).
+    Falls back to True on API errors to avoid blocking on outage.
     """
     if not description or not description.strip():
         return False
@@ -155,12 +168,13 @@ def is_immigration_related_ai(description: str) -> bool:
             "Content-Type": "application/json",
         }
         prompt = (
-            f"You are a content classifier for an immigration news account. "
+            f"You are a content classifier for an immigration and international education news account. "
             f"Read the following TikTok video description and answer with ONE word only: "
             f"YES if the video is specifically about immigration, visas, work permits, "
-            f"student visas, citizenship, deportation, or related immigration topics. "
-            f"Answer NO if it is about war, crime, politics unrelated to immigration, "
-            f"sports, entertainment, or any other topic.\n\n"
+            f"student visas, international students, study abroad, citizenship, deportation, "
+            f"refugees, asylum, or related immigration and international education topics. "
+            f"Answer NO if it is about war, crime, domestic politics unrelated to immigration, "
+            f"sports, entertainment, or any other unrelated topic.\n\n"
             f"Description: \"{description[:500]}\""
         )
         payload = {
@@ -180,8 +194,53 @@ def is_immigration_related_ai(description: str) -> bool:
         print(f"[AI GATE] DeepSeek says: {answer} | {description[:60]}")
         return answer.startswith("YES")
     except Exception as e:
-        print(f"[WARN] AI gate failed ({e}), falling back to keyword filter result")
+        print(f"[WARN] AI gate failed ({e}), allowing through")
         return True
+
+
+def is_duplicate_topic_ai(description: str, recent_summaries: List[str]) -> bool:
+    """
+    Third-pass duplicate topic check — asks DeepSeek if this video covers
+    the same topic as any of the recently posted summaries.
+    Returns True if it IS a duplicate (should be skipped).
+    Falls back to False on API errors (allow through rather than block).
+    """
+    if not recent_summaries:
+        return False  # No history to compare against
+    try:
+        headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        recent_list = "\n".join(
+            f"- {s[:150]}" for s in recent_summaries[:20]
+        )
+        prompt = (
+            f"You are a duplicate content checker for a social media account. "
+            f"Determine if the NEW video covers the same core topic as any of the RECENTLY POSTED videos. "
+            f"Answer with ONE word only: YES if it is a duplicate topic, NO if it is genuinely different.\n\n"
+            f"NEW VIDEO DESCRIPTION:\n\"{description[:400]}\"\n\n"
+            f"RECENTLY POSTED TOPICS:\n{recent_list}"
+        )
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 5,
+            "temperature": 0.0,
+        }
+        r = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+        r.raise_for_status()
+        answer = r.json()["choices"][0]["message"]["content"].strip().upper()
+        print(f"[DUPE CHECK] DeepSeek says: {answer} | {description[:60]}")
+        return answer.startswith("YES")
+    except Exception as e:
+        print(f"[WARN] Duplicate check failed ({e}), allowing through")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +293,9 @@ def scrape_accounts(accounts: List[str], videos_per_account: int = 5) -> List[di
 # ---------------------------------------------------------------------------
 # Pick the best unseen, relevant video
 # ---------------------------------------------------------------------------
-def pick_video(all_videos: List[dict], seen_ids: set, seen_urls: set) -> Optional[dict]:
+def pick_video(all_videos: List[dict], seen_ids: set, seen_urls: set, recent_summaries: List[str] = None) -> Optional[dict]:
     candidates = []
+    recent_summaries = recent_summaries or []
 
     for video in all_videos:
         url = normalise_url(video.get("webVideoUrl", ""))
@@ -245,7 +305,7 @@ def pick_video(all_videos: List[dict], seen_ids: set, seen_urls: set) -> Optiona
         if not url or not vid:
             continue
 
-        # Skip already-posted videos
+        # Skip already-posted videos (exact ID/URL match)
         if url in seen_urls or vid in seen_ids:
             continue
 
@@ -255,9 +315,14 @@ def pick_video(all_videos: List[dict], seen_ids: set, seen_urls: set) -> Optiona
             print(f"[SKIP] Keyword filter rejected: {description[:80]}")
             continue
 
-        # Layer 2: DeepSeek AI gate (strict YES/NO classification)
+        # Layer 2: DeepSeek AI gate (strict YES/NO relevance classification)
         if not is_immigration_related_ai(description):
             print(f"[SKIP] AI gate rejected: {description[:80]}")
+            continue
+
+        # Layer 3: DeepSeek duplicate topic check
+        if is_duplicate_topic_ai(description, recent_summaries):
+            print(f"[SKIP] Duplicate topic rejected: {description[:80]}")
             continue
 
         candidates.append(video)
@@ -415,15 +480,16 @@ def run_pipeline(body: RunRequest):
     try:
         seen_ids = set(str(i).strip() for i in (body.seen_ids or []) if i)
         seen_urls = set(str(u).strip() for u in (body.seen_urls or []) if u)
-        print(f"[INFO] Received {len(seen_ids)} seen IDs and {len(seen_urls)} seen URLs from n8n")
+        recent_summaries = [str(s).strip() for s in (body.recent_summaries or []) if s]
+        print(f"[INFO] Received {len(seen_ids)} seen IDs, {len(seen_urls)} seen URLs, {len(recent_summaries)} recent summaries")
 
-        # 1. Scrape all curated accounts
-        all_videos = scrape_accounts(IMMIGRATION_ACCOUNTS, videos_per_account=5)
+        # 1. Scrape all curated accounts (10 videos each for wider selection pool)
+        all_videos = scrape_accounts(IMMIGRATION_ACCOUNTS, videos_per_account=10)
         if not all_videos:
             return JSONResponse({"status": "no_videos", "message": "Apify returned no videos"})
 
-        # 2. Pick best unseen, relevant video
-        video = pick_video(all_videos, seen_ids, seen_urls)
+        # 2. Pick best unseen, relevant, non-duplicate video
+        video = pick_video(all_videos, seen_ids, seen_urls, recent_summaries)
         if not video:
             return JSONResponse({
                 "status": "no_fresh_video",
