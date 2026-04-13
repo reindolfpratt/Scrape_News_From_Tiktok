@@ -2,6 +2,7 @@ import glob
 import os
 import re
 import time
+import concurrent.futures
 
 import cloudinary
 import cloudinary.uploader
@@ -33,7 +34,6 @@ def normalise_url(url):
 
 
 def extract_video_id(url):
-    # FIX 1: was r"/video/(\\d+)" — double backslash in raw string never matched digits
     m = re.search(r"/video/(\d+)", url or "")
     return m.group(1) if m else ""
 
@@ -67,14 +67,34 @@ def extract_keywords(text):
     return set(w for w in words if w not in stop_words and len(w) > 2)
 
 
+def detect_country(headline):
+    """Detect which country the headline is about using strict word boundaries."""
+    headline_lower = headline.lower()
+    country_keywords = {
+        "Canada": [r"\bcanada\b", r"\bcanadian\b", r"\bircc\b"],
+        "UK": [r"\buk\b", r"\bunited kingdom\b", r"\bbritain\b", r"\bbritish\b", r"\bhome office\b"],
+        "USA": [r"\busa\b", r"\bus\b", r"\bunited states\b", r"\bamerican\b", r"\bamerica\b", r"\brubio\b", r"\btrump\b", r"\buscis\b"],
+        "Australia": [r"\baustralia\b", r"\baustralian\b"],
+        "EU": [r"\beurope\b", r"\beuropean\b", r"\beu\b", r"\bschengen\b"]
+    }
+    for country, keywords in country_keywords.items():
+        if any(re.search(kw, headline_lower) for kw in keywords):
+            return country
+    return None
+
+
 def is_duplicate_topic(new_headline, used_headlines, threshold=0.5):
     """Return True if new_headline covers the same topic as any used headline."""
+    new_normalised = new_headline.strip().lower()
     new_kw = extract_keywords(new_headline)
-    if not new_kw:
-        return False
+
     for old in used_headlines:
+        # Hard exact-match guard — catches Perplexity returning the identical headline
+        if old.strip().lower() == new_normalised:
+            return True
+        # Fuzzy keyword overlap
         old_kw = extract_keywords(old)
-        if not old_kw:
+        if not new_kw or not old_kw:
             continue
         overlap = len(new_kw & old_kw) / min(len(new_kw), len(old_kw))
         if overlap >= threshold:
@@ -83,13 +103,29 @@ def is_duplicate_topic(new_headline, used_headlines, threshold=0.5):
 
 
 def get_posted_history():
-    try:
-        r = requests.get(APPS_SCRIPT_URL, timeout=20, allow_redirects=True)
-        r.raise_for_status()
-        rows = r.json()
-    except Exception as e:
-        print(f"[WARN] Could not fetch history: {e} — continuing with empty history")
-        return set(), set(), []
+    max_retries = 3
+    rows = []
+
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(APPS_SCRIPT_URL, timeout=20, allow_redirects=True)
+            r.raise_for_status()
+            # Validate we got JSON, not a redirect page
+            content_type = r.headers.get("Content-Type", "")
+            if "application/json" not in content_type:
+                raise Exception(f"Expected JSON, got {content_type}")
+            rows = r.json()
+            print(f"[INFO] Loaded {len(rows)} rows from history")
+            break
+        except Exception as e:
+            wait = 2 ** attempt  # exponential backoff: 1s, 2s, 4s
+            print(f"[WARN] History fetch attempt {attempt+1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                print(f"[INFO] Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"[ERROR] All retries exhausted — ALL dedup is disabled this run")
+                return set(), set(), []
 
     seen_urls, seen_ids, used_headlines = set(), set(), []
     for row in rows:
@@ -99,6 +135,9 @@ def get_posted_history():
         if u: seen_urls.add(u)
         if v: seen_ids.add(v)
         if h: used_headlines.append(h)
+
+    print(f"[DEBUG] used_headlines count: {len(used_headlines)}")
+    print(f"[DEBUG] First 3 headlines: {used_headlines[:3]}")
 
     return seen_urls, seen_ids, used_headlines
 
@@ -167,7 +206,7 @@ def get_immigration_news(used_headlines=None):
     return headline, summary, caption
 
 
-def search_tiktok(keyword, seen_urls, seen_ids, headline_keywords=None):
+def search_tiktok(keyword, seen_urls, seen_ids, headline_keywords=None, trusted_only=False):
     run_url = f"https://api.apify.com/v2/acts/clockworks~tiktok-scraper/runs?token={APIFY_API_KEY}"
     r = requests.post(run_url, json={"searchQueries": [keyword], "resultsPerPage": 15}, timeout=30)
     r.raise_for_status()
@@ -204,12 +243,11 @@ def search_tiktok(keyword, seen_urls, seen_ids, headline_keywords=None):
             continue
         if url in seen_urls or (vid and vid in seen_ids):
             continue
-            
+
         description = (video.get("text", "") or "").lower()
         if headline_keywords:
             video_kw = extract_keywords(description)
             overlap = len(headline_keywords & video_kw)
-            # Require at least 2 matching keywords (or 1 if the headline is very short)
             min_match = min(2, len(headline_keywords))
             if overlap < min_match:
                 continue
@@ -223,11 +261,14 @@ def search_tiktok(keyword, seen_urls, seen_ids, headline_keywords=None):
     trusted.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
     others.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
 
+    # If trusted_only mode, only return trusted accounts
+    if trusted_only:
+        return trusted[0] if trusted else None
+
     return trusted[0] if trusted else (others[0] if others else None)
 
 
 def download_video(video):
-    # FIX 3: Use Apify's direct URL first — yt-dlp is unreliable for TikTok
     direct_url = (
         video.get("videoUrl")
         or video.get("downloadAddr")
@@ -257,7 +298,6 @@ def download_video(video):
         except Exception:
             pass  # fall through to yt-dlp
 
-    # Fallback: yt-dlp
     return _ytdlp_download(normalise_url(video.get("webVideoUrl", "")))
 
 
@@ -340,14 +380,15 @@ def run_pipeline():
             headline, summary, caption = get_immigration_news(used_headlines + rejected)
             if not headline:
                 return JSONResponse({"status": "no_news", "message": "No immigration news found"})
-                
+
             if is_duplicate_topic(headline, used_headlines):
                 print(f"[INFO] Attempt {attempt+1}: Rejected duplicate topic: {headline}")
                 rejected.append(headline)
-                headline = ""  # Clear so we retry
+                headline = ""
                 continue
-                
-            break  # It passed the check!
+
+            print(f"[INFO] Accepted headline on attempt {attempt+1}: {headline}")
+            break
 
         if not headline:
             return JSONResponse({
@@ -357,16 +398,43 @@ def run_pipeline():
             })
 
         headline_kw = extract_keywords(headline)
-        
-        # Build a more targeted search query using top keywords + "news"
-        search_terms = sorted(list(headline_kw), key=len, reverse=True)[:4]
-        search_query = " ".join(search_terms) + " news"
+        country = detect_country(headline)
+        print(f"[INFO] Detected country: {country or 'Unknown'}")
 
-        video = search_tiktok(search_query, seen_urls, seen_ids, headline_kw)
+        search_terms = sorted(list(headline_kw), key=len, reverse=True)[:4]
+        base_query = " ".join(search_terms)
+
+        # Execute Apify tasks in parallel to prevent 504 Gateway Timeouts on long sequential runs
+        print(f"[INFO] Firing Apify searches concurrently to prevent timeouts...")
+        fallback_query = f"{base_query} {country.lower()}" if country else base_query
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            future_trusted = executor.submit(search_tiktok, base_query, seen_urls, seen_ids, headline_kw, trusted_only=True)
+            future_fallback = executor.submit(search_tiktok, fallback_query, seen_urls, seen_ids, headline_kw, trusted_only=False)
+            future_base = executor.submit(search_tiktok, base_query, seen_urls, seen_ids, headline_kw, trusted_only=False) if country else future_fallback
+            
+            # Step 1: Check trusted first
+            video = future_trusted.result()
+            if video:
+                print(f"[INFO] Selected TRUSTED account for: {base_query}")
+                
+            # Step 2: Fall back to country-specific search
+            if not video and country:
+                video = future_fallback.result()
+                if video:
+                    print(f"[INFO] Selected COUNTRY FALLBACK video: {fallback_query}")
+
+            # Step 3: Last resort - base generic search
+            if not video:
+                video = future_base.result()
+                if video:
+                    print(f"[INFO] Selected LAST RESORT video: {base_query}")
+
         if not video:
             return JSONResponse({"status": "no_fresh_video", "message": "No relevant unseen TikTok video found for this topic"})
 
-        author = (video.get("authorMeta", {}).get("name", "") or "unknown").strip()
+        author_meta = video.get("authorMeta", {}) or {}
+        handle = author_meta.get("uniqueId") or author_meta.get("nickName") or "unknown"
         tiktok_url = normalise_url(video.get("webVideoUrl", ""))
         video_id = extract_video_id(tiktok_url)
         play_count = int(video.get("playCount") or 0)
@@ -374,20 +442,25 @@ def run_pipeline():
         if not tiktok_url:
             return JSONResponse({"status": "no_video_url", "message": "No usable TikTok URL on selected video"})
 
-        tmp_path = download_video(video)  # passes full dict now
+        tmp_path = download_video(video)
         cloudinary_url = upload_to_cloudinary(tmp_path)
-        
-        caption_with_contact = f"{caption}\n\nContact us: www.cohbyconsult.com"
-        
-        write_to_sheet(headline, summary, caption_with_contact, cloudinary_url, author, tiktok_url, video_id)
+
+        # FIX: inject TikTok source and contact into caption with @handle format
+        caption_with_contact = (
+            f"{caption}\n\n"
+            f"TikTok source: @{handle}\n"
+            f"Contact us: www.cohbyconsult.com"
+        )
+
+        write_to_sheet(headline, summary, caption_with_contact, cloudinary_url, f"@{handle}", tiktok_url, video_id)
 
         return JSONResponse({
             "status": "success",
             "cloudinary_url": cloudinary_url,
-            "caption": caption,
+            "caption": caption_with_contact,
             "headline": headline,
             "summary": summary,
-            "tiktok_source": author,
+            "tiktok_source": f"@{handle}",
             "tiktok_url": tiktok_url,
             "video_id": video_id,
             "play_count": play_count
