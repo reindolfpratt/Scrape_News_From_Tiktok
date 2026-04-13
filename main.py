@@ -38,6 +38,50 @@ def extract_video_id(url):
     return m.group(1) if m else ""
 
 
+def resolve_short_url(url):
+    """Follow redirects on shortened TikTok URLs to get the canonical URL."""
+    if not url or ("vm.tiktok" not in url and "vt.tiktok" not in url):
+        return url
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=10,
+                          headers={"User-Agent": "Mozilla/5.0"})
+        return normalise_url(r.url)
+    except Exception:
+        return url
+
+
+def extract_keywords(text):
+    """Extract meaningful keywords from a headline for topic comparison."""
+    stop_words = {
+        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+        'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
+        'and', 'or', 'but', 'not', 'no', 'it', 'its', 'this', 'that',
+        'new', 'will', 'has', 'have', 'had', 'may', 'could',
+        'would', 'should', 'as', 'up', 'out', 'over', 'after', 'into',
+        'about', 'says', 'said', 'set', 'get', 'gets', 'got', 'more',
+        'what', 'how', 'why', 'when', 'who', 'which', 'their', 'they',
+        'plan', 'plans', 'update', 'latest', 'breaking', 'just', 'now',
+        'news', 'report', 'reports', 'announced', 'announces', 'amid',
+    }
+    words = re.findall(r'[a-z]+', text.lower())
+    return set(w for w in words if w not in stop_words and len(w) > 2)
+
+
+def is_duplicate_topic(new_headline, used_headlines, threshold=0.5):
+    """Return True if new_headline covers the same topic as any used headline."""
+    new_kw = extract_keywords(new_headline)
+    if not new_kw:
+        return False
+    for old in used_headlines:
+        old_kw = extract_keywords(old)
+        if not old_kw:
+            continue
+        overlap = len(new_kw & old_kw) / min(len(new_kw), len(old_kw))
+        if overlap >= threshold:
+            return True
+    return False
+
+
 def get_posted_history():
     try:
         r = requests.get(APPS_SCRIPT_URL, timeout=20, allow_redirects=True)
@@ -67,10 +111,17 @@ def get_immigration_news(used_headlines=None):
 
     exclusion = ""
     if used_headlines:
-        # FIX 2: was \\n — that sends literal backslash-n, not a newline
+        all_topics = set()
+        for h in used_headlines:
+            all_topics.update(extract_keywords(h))
+        topic_str = ", ".join(sorted(all_topics)[:40])
+
         exclusion = (
-            "\n\nDo NOT suggest any of these stories — they have already been used:\n"
+            "\n\nCRITICAL — Do NOT suggest any of these stories OR any story on the same topic. "
+            "Each story below has ALREADY been covered:\n"
             + "\n".join(f"- {h}" for h in used_headlines)
+            + f"\n\nAvoid stories involving these topics/keywords: {topic_str}"
+            + "\n\nYou MUST suggest a COMPLETELY DIFFERENT story that is not related to any of the above."
         )
 
     payload = {
@@ -78,7 +129,7 @@ def get_immigration_news(used_headlines=None):
         "messages": [
             {
                 "role": "system",
-                "content": "You are a news assistant. Always reply in the exact format requested. No extra text, no markdown, no preamble."
+                "content": "You are a news assistant. Always reply in the exact format requested. No extra text, no markdown, no preamble. Never repeat a topic you have been told to avoid."
             },
             {
                 "role": "user",
@@ -116,9 +167,9 @@ def get_immigration_news(used_headlines=None):
     return headline, summary, caption
 
 
-def search_tiktok(keyword, seen_urls, seen_ids):
+def search_tiktok(keyword, seen_urls, seen_ids, headline_keywords=None):
     run_url = f"https://api.apify.com/v2/acts/clockworks~tiktok-scraper/runs?token={APIFY_API_KEY}"
-    r = requests.post(run_url, json={"searchQueries": [keyword], "resultsPerPage": 10}, timeout=30)
+    r = requests.post(run_url, json={"searchQueries": [keyword], "resultsPerPage": 15}, timeout=30)
     r.raise_for_status()
     run_id = r.json()["data"]["id"]
 
@@ -147,11 +198,22 @@ def search_tiktok(keyword, seen_urls, seen_ids):
     trusted, others = [], []
     for video in results:
         url = normalise_url(video.get("webVideoUrl", ""))
+        url = resolve_short_url(url)
         vid = extract_video_id(url)
         if not url:
             continue
         if url in seen_urls or (vid and vid in seen_ids):
             continue
+            
+        description = (video.get("text", "") or "").lower()
+        if headline_keywords:
+            video_kw = extract_keywords(description)
+            overlap = len(headline_keywords & video_kw)
+            # Require at least 2 matching keywords (or 1 if the headline is very short)
+            min_match = min(2, len(headline_keywords))
+            if overlap < min_match:
+                continue
+
         author = (video.get("authorMeta", {}).get("name", "") or "").lower()
         if any(t in author for t in TRUSTED_ACCOUNTS):
             trusted.append(video)
@@ -271,13 +333,38 @@ def run_pipeline():
     try:
         seen_urls, seen_ids, used_headlines = get_posted_history()
 
-        headline, summary, caption = get_immigration_news(used_headlines)
-        if not headline:
-            return JSONResponse({"status": "no_news", "message": "No immigration news found"})
+        # Try up to 3 times to get a genuinely new topic
+        headline, summary, caption = "", "", ""
+        rejected = []
+        for attempt in range(3):
+            headline, summary, caption = get_immigration_news(used_headlines + rejected)
+            if not headline:
+                return JSONResponse({"status": "no_news", "message": "No immigration news found"})
+                
+            if is_duplicate_topic(headline, used_headlines):
+                print(f"[INFO] Attempt {attempt+1}: Rejected duplicate topic: {headline}")
+                rejected.append(headline)
+                headline = ""  # Clear so we retry
+                continue
+                
+            break  # It passed the check!
 
-        video = search_tiktok(f"immigration {headline[:60]}", seen_urls, seen_ids)
+        if not headline:
+            return JSONResponse({
+                "status": "no_fresh_topic",
+                "message": "Could not find a fresh news topic after 3 attempts",
+                "rejected": rejected
+            })
+
+        headline_kw = extract_keywords(headline)
+        
+        # Build a more targeted search query using top keywords + "news"
+        search_terms = sorted(list(headline_kw), key=len, reverse=True)[:4]
+        search_query = " ".join(search_terms) + " news"
+
+        video = search_tiktok(search_query, seen_urls, seen_ids, headline_kw)
         if not video:
-            return JSONResponse({"status": "no_fresh_video", "message": "No new unseen TikTok video found"})
+            return JSONResponse({"status": "no_fresh_video", "message": "No relevant unseen TikTok video found for this topic"})
 
         author = (video.get("authorMeta", {}).get("name", "") or "unknown").strip()
         tiktok_url = normalise_url(video.get("webVideoUrl", ""))
