@@ -21,23 +21,10 @@ cloudinary.config(
     api_secret=os.environ["CLOUDINARY_API_SECRET"]
 )
 
-OFFICIAL_CHANNELS = [
-    "securebordersuk", "citimmcanada", "uscis", "ausgov_homeaffairs",
-    "homeoffice", "borderforce", "govuk"
-]
-
-NEWS_CHANNELS = [
+TRUSTED_ACCOUNTS = [
     "bbc", "bbcnews", "cnn", "skynews", "itvnews",
     "channel4news", "guardiannews", "independent",
-    "reuters", "apnews", "gbnews", "dwnews", "timesradio",
-    "washingtonpost", "nbcnews", "cbsnews", "nytimes", "abcnews",
-    "cbcnews", "ctvnews", "globalnews", "abcnews_au", "skynews_au",
-    "7news", "9news", "euronews", "france24"
-]
-
-EXPERT_CHANNELS = [
-    "theimmigrationlawyer", "immigrationshop", "studyportals",
-    "idp-education", "qs_world_university_rankings"
+    "reuters", "apnews", "gbnews", "dwnews", "timesradio"
 ]
 
 
@@ -49,54 +36,6 @@ def extract_video_id(url):
     # FIX 1: was r"/video/(\\d+)" — double backslash in raw string never matched digits
     m = re.search(r"/video/(\d+)", url or "")
     return m.group(1) if m else ""
-
-
-def resolve_short_url(url):
-    """Follow redirects on shortened TikTok URLs to get the canonical URL."""
-    if not url or ("vm.tiktok" not in url and "vt.tiktok" not in url):
-        return url
-    try:
-        r = requests.head(url, allow_redirects=True, timeout=10,
-                          headers={"User-Agent": "Mozilla/5.0"})
-        return normalise_url(r.url)
-    except Exception:
-        return url
-
-
-def extract_keywords(text):
-    """Extract meaningful keywords from a headline for topic comparison."""
-    stop_words = {
-        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-        'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
-        'and', 'or', 'but', 'not', 'no', 'it', 'its', 'this', 'that',
-        'new', 'will', 'has', 'have', 'had', 'may', 'could',
-        'would', 'should', 'as', 'up', 'out', 'over', 'after', 'into',
-        'about', 'says', 'said', 'set', 'get', 'gets', 'got', 'more',
-        'what', 'how', 'why', 'when', 'who', 'which', 'their', 'they',
-        'plan', 'plans', 'update', 'latest', 'breaking', 'just', 'now',
-        'news', 'report', 'reports', 'announced', 'announces', 'amid',
-    }
-    words = re.findall(r'[a-z]+', text.lower())
-    return set(w for w in words if w not in stop_words and len(w) > 2)
-
-
-def is_duplicate_topic(new_headline, used_headlines, threshold=0.5):
-    """Return True if new_headline covers the same topic as any used headline.
-
-    Uses keyword overlap: if >= 50 % of the smaller keyword set overlaps,
-    the headlines are considered the same topic.
-    """
-    new_kw = extract_keywords(new_headline)
-    if not new_kw:
-        return False
-    for old in used_headlines:
-        old_kw = extract_keywords(old)
-        if not old_kw:
-            continue
-        overlap = len(new_kw & old_kw) / min(len(new_kw), len(old_kw))
-        if overlap >= threshold:
-            return True
-    return False
 
 
 def get_posted_history():
@@ -128,18 +67,10 @@ def get_immigration_news(used_headlines=None):
 
     exclusion = ""
     if used_headlines:
-        # Build topic keywords from used headlines to prevent same-topic suggestions
-        all_topics = set()
-        for h in used_headlines:
-            all_topics.update(extract_keywords(h))
-        topic_str = ", ".join(sorted(all_topics)[:40])
-
+        # FIX 2: was \\n — that sends literal backslash-n, not a newline
         exclusion = (
-            "\n\nCRITICAL — Do NOT suggest any of these stories OR any story on the same topic. "
-            "Each story below has ALREADY been covered:\n"
+            "\n\nDo NOT suggest any of these stories — they have already been used:\n"
             + "\n".join(f"- {h}" for h in used_headlines)
-            + f"\n\nAvoid stories involving these topics/keywords: {topic_str}"
-            + "\n\nYou MUST suggest a COMPLETELY DIFFERENT immigration story that is not related to any of the above."
         )
 
     payload = {
@@ -147,19 +78,12 @@ def get_immigration_news(used_headlines=None):
         "messages": [
             {
                 "role": "system",
-                "content": "You are a news assistant. Always reply in the exact format requested. No extra text, no markdown, no preamble. Never repeat a topic you have been told to avoid."
+                "content": "You are a news assistant. Always reply in the exact format requested. No extra text, no markdown, no preamble."
             },
             {
                 "role": "user",
                 "content": (
-                    "What is the single most important official news story or policy announcement from the last 20 days "
-                    "regarding international university studies or immigration in the UK, Canada, USA, Australia, "
-                    "or across Europe?\n\n"
-                    "FOCUS: Prioritize official government announcements, visa policy changes, and major academic updates. "
-                    "Always report accurate facts, even if they include restrictions but official news. "
-                    "CRITICAL: Avoid any 'negative opinion' stories, vlogs, or content where individuals are simply sharing "
-                    "personal bad experiences to discourage others from applying. We want to be encouraging, "
-                    "informative news source for students and immigrants.\n\n"
+                    "What is the single most important UK immigration news story from the last 20 days? "
                     "Reply in exactly this format and nothing else:\n"
                     "HEADLINE: <headline>\n"
                     "SUMMARY: <two sentence summary>\n"
@@ -192,9 +116,9 @@ def get_immigration_news(used_headlines=None):
     return headline, summary, caption
 
 
-def search_tiktok(keyword, seen_urls, seen_ids, headline_keywords=None):
+def search_tiktok(keyword, seen_urls, seen_ids):
     run_url = f"https://api.apify.com/v2/acts/clockworks~tiktok-scraper/runs?token={APIFY_API_KEY}"
-    r = requests.post(run_url, json={"searchQueries": [keyword], "resultsPerPage": 20}, timeout=30)
+    r = requests.post(run_url, json={"searchQueries": [keyword], "resultsPerPage": 10}, timeout=30)
     r.raise_for_status()
     run_id = r.json()["data"]["id"]
 
@@ -220,51 +144,24 @@ def search_tiktok(keyword, seen_urls, seen_ids, headline_keywords=None):
     if not results:
         return None
 
-    official, news, expert, others = [], [], [], []
+    trusted, others = [], []
     for video in results:
         url = normalise_url(video.get("webVideoUrl", ""))
-        url = resolve_short_url(url)
         vid = extract_video_id(url)
         if not url:
             continue
         if url in seen_urls or (vid and vid in seen_ids):
             continue
-
         author = (video.get("authorMeta", {}).get("name", "") or "").lower()
-        handle = (video.get("authorMeta", {}).get("uniqueId", "") or "").lower()
-        description = (video.get("text", "") or "").lower()
-
-        is_official = any(t in author or t in handle for t in OFFICIAL_CHANNELS)
-        is_news = any(t in author or t in handle for t in NEWS_CHANNELS)
-        is_expert = any(t in author or t in handle for t in EXPERT_CHANNELS)
-
-        # Relevance Check: Ensure the video description matches the headline keywords
-        if headline_keywords:
-            video_kw = extract_keywords(description)
-            overlap = len(headline_keywords & video_kw)
-            # Looser check for Official/News (1 match), stricter for Others (2 matches)
-            min_match = 1 if (is_official or is_news) else min(2, len(headline_keywords))
-            if overlap < min_match:
-                continue
-
-        if is_official:
-            official.append(video)
-        elif is_news:
-            news.append(video)
-        elif is_expert:
-            expert.append(video)
+        if any(t in author for t in TRUSTED_ACCOUNTS):
+            trusted.append(video)
         else:
             others.append(video)
 
-    # Sort each tier by play count (most viewed first)
-    for bucket in [official, news, expert, others]:
-        bucket.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
+    trusted.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
+    others.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
 
-    # Priority selection
-    if official: return official[0]
-    if news: return news[0]
-    if expert: return expert[0]
-    return others[0] if others else None
+    return trusted[0] if trusted else (others[0] if others else None)
 
 
 def download_video(video):
@@ -374,37 +271,13 @@ def run_pipeline():
     try:
         seen_urls, seen_ids, used_headlines = get_posted_history()
 
-        # Try up to 3 times to get a genuinely new topic
-        headline, summary, caption = "", "", ""
-        rejected = []
-        for attempt in range(3):
-            headline, summary, caption = get_immigration_news(used_headlines + rejected)
-            if not headline:
-                return JSONResponse({"status": "no_news", "message": "No immigration news found"})
-            if is_duplicate_topic(headline, used_headlines):
-                print(f"[INFO] Attempt {attempt+1}: Rejected duplicate topic: {headline}")
-                rejected.append(headline)
-                headline = ""
-                continue
-            break
-
+        headline, summary, caption = get_immigration_news(used_headlines)
         if not headline:
-            return JSONResponse({
-                "status": "no_fresh_topic",
-                "message": "Could not find a fresh news topic after 3 attempts",
-                "rejected": rejected
-            })
+            return JSONResponse({"status": "no_news", "message": "No immigration news found"})
 
-        headline_kw = extract_keywords(headline)
-        
-        # Build a more targeted news-centric search query
-        # Using top 4 keywords + "news" is much more effective than the full headline
-        search_terms = sorted(list(headline_kw), key=len, reverse=True)[:4]
-        search_query = " ".join(search_terms) + " news"
-
-        video = search_tiktok(search_query, seen_urls, seen_ids, headline_kw)
+        video = search_tiktok(f"UK immigration {headline[:60]}", seen_urls, seen_ids)
         if not video:
-            return JSONResponse({"status": "no_fresh_video", "message": "No new unseen or relevant TikTok video found"})
+            return JSONResponse({"status": "no_fresh_video", "message": "No new unseen TikTok video found"})
 
         author = (video.get("authorMeta", {}).get("name", "") or "unknown").strip()
         tiktok_url = normalise_url(video.get("webVideoUrl", ""))
@@ -416,26 +289,15 @@ def run_pipeline():
 
         tmp_path = download_video(video)  # passes full dict now
         cloudinary_url = upload_to_cloudinary(tmp_path)
-
-        handle = video.get("authorMeta", {}).get("uniqueId", "unknown")
-        
-        # Updated branding for the caption
-        attributed_caption = (
-            f"{caption}\n\n"
-            "Sourced from TikTok\n"
-            "Contact us: www.cohbyconsult.com"
-        )
-
-        write_to_sheet(headline, summary, attributed_caption, cloudinary_url, author, tiktok_url, video_id)
+        write_to_sheet(headline, summary, caption, cloudinary_url, author, tiktok_url, video_id)
 
         return JSONResponse({
             "status": "success",
             "cloudinary_url": cloudinary_url,
-            "caption": attributed_caption,
+            "caption": caption,
             "headline": headline,
             "summary": summary,
             "tiktok_source": author,
-            "tiktok_handle": handle,
             "tiktok_url": tiktok_url,
             "video_id": video_id,
             "play_count": play_count
