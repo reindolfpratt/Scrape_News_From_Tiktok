@@ -192,9 +192,9 @@ def get_immigration_news(used_headlines=None):
     return headline, summary, caption
 
 
-def search_tiktok(keyword, seen_urls, seen_ids):
+def search_tiktok(keyword, seen_urls, seen_ids, headline_keywords=None):
     run_url = f"https://api.apify.com/v2/acts/clockworks~tiktok-scraper/runs?token={APIFY_API_KEY}"
-    r = requests.post(run_url, json={"searchQueries": [keyword], "resultsPerPage": 10}, timeout=30)
+    r = requests.post(run_url, json={"searchQueries": [keyword], "resultsPerPage": 20}, timeout=30)
     r.raise_for_status()
     run_id = r.json()["data"]["id"]
 
@@ -232,12 +232,26 @@ def search_tiktok(keyword, seen_urls, seen_ids):
 
         author = (video.get("authorMeta", {}).get("name", "") or "").lower()
         handle = (video.get("authorMeta", {}).get("uniqueId", "") or "").lower()
+        description = (video.get("text", "") or "").lower()
 
-        if any(t in author or t in handle for t in OFFICIAL_CHANNELS):
+        is_official = any(t in author or t in handle for t in OFFICIAL_CHANNELS)
+        is_news = any(t in author or t in handle for t in NEWS_CHANNELS)
+        is_expert = any(t in author or t in handle for t in EXPERT_CHANNELS)
+
+        # Relevance Check: Ensure the video description matches the headline keywords
+        if headline_keywords:
+            video_kw = extract_keywords(description)
+            overlap = len(headline_keywords & video_kw)
+            # Looser check for Official/News (1 match), stricter for Others (2 matches)
+            min_match = 1 if (is_official or is_news) else min(2, len(headline_keywords))
+            if overlap < min_match:
+                continue
+
+        if is_official:
             official.append(video)
-        elif any(t in author or t in handle for t in NEWS_CHANNELS):
+        elif is_news:
             news.append(video)
-        elif any(t in author or t in handle for t in EXPERT_CHANNELS):
+        elif is_expert:
             expert.append(video)
         else:
             others.append(video)
@@ -381,10 +395,16 @@ def run_pipeline():
                 "rejected": rejected
             })
 
-        search_query = f"{headline[:60]}"
-        video = search_tiktok(search_query, seen_urls, seen_ids)
+        headline_kw = extract_keywords(headline)
+        
+        # Build a more targeted news-centric search query
+        # Using top 4 keywords + "news" is much more effective than the full headline
+        search_terms = sorted(list(headline_kw), key=len, reverse=True)[:4]
+        search_query = " ".join(search_terms) + " news"
+
+        video = search_tiktok(search_query, seen_urls, seen_ids, headline_kw)
         if not video:
-            return JSONResponse({"status": "no_fresh_video", "message": "No new unseen TikTok video found"})
+            return JSONResponse({"status": "no_fresh_video", "message": "No new unseen or relevant TikTok video found"})
 
         author = (video.get("authorMeta", {}).get("name", "") or "unknown").strip()
         tiktok_url = normalise_url(video.get("webVideoUrl", ""))
@@ -397,9 +417,12 @@ def run_pipeline():
         tmp_path = download_video(video)  # passes full dict now
         cloudinary_url = upload_to_cloudinary(tmp_path)
 
-        # Automatically credit the source in the caption
-        handle = video.get("authorMeta", {}).get("uniqueId", "unknown")
-        attributed_caption = f"{caption}\n\nSource: @{handle}"
+        # Updated branding for the caption
+        attributed_caption = (
+            f"{caption}\n\n"
+            "Sourced from TikTok\n"
+            "Contact us: www.cohbyconsult.com"
+        )
 
         write_to_sheet(headline, summary, attributed_caption, cloudinary_url, author, tiktok_url, video_id)
 
