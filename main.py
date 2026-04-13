@@ -24,7 +24,10 @@ cloudinary.config(
 TRUSTED_ACCOUNTS = [
     "bbc", "bbcnews", "cnn", "skynews", "itvnews",
     "channel4news", "guardiannews", "independent",
-    "reuters", "apnews", "gbnews", "dwnews", "timesradio"
+    "reuters", "apnews", "gbnews", "dwnews", "timesradio",
+    "washingtonpost", "nbcnews", "cbsnews", "nytimes", "abcnews",
+    "cbcnews", "ctvnews", "globalnews", "abcnews_au", "skynews_au",
+    "7news", "9news", "euronews", "france24"
 ]
 
 
@@ -56,7 +59,7 @@ def extract_keywords(text):
         'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
         'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
         'and', 'or', 'but', 'not', 'no', 'it', 'its', 'this', 'that',
-        'uk', 'new', 'will', 'has', 'have', 'had', 'may', 'could',
+        'new', 'will', 'has', 'have', 'had', 'may', 'could',
         'would', 'should', 'as', 'up', 'out', 'over', 'after', 'into',
         'about', 'says', 'said', 'set', 'get', 'gets', 'got', 'more',
         'what', 'how', 'why', 'when', 'who', 'which', 'their', 'they',
@@ -139,7 +142,9 @@ def get_immigration_news(used_headlines=None):
             {
                 "role": "user",
                 "content": (
-                    "What is the single most important UK immigration news story from the last 20 days? "
+                    "What is the single most important news story from the last 20 days regarding "
+                    "international university studies (for international students) or immigration policy "
+                    "in the UK, Canada, USA, Australia, or Europe? "
                     "Reply in exactly this format and nothing else:\n"
                     "HEADLINE: <headline>\n"
                     "SUMMARY: <two sentence summary>\n"
@@ -350,7 +355,8 @@ def run_pipeline():
                 "rejected": rejected
             })
 
-        video = search_tiktok(f"UK immigration {headline[:60]}", seen_urls, seen_ids)
+        search_query = f"{headline[:60]}"
+        video = search_tiktok(search_query, seen_urls, seen_ids)
         if not video:
             return JSONResponse({"status": "no_fresh_video", "message": "No new unseen TikTok video found"})
 
