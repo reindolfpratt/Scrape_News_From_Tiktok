@@ -21,13 +21,23 @@ cloudinary.config(
     api_secret=os.environ["CLOUDINARY_API_SECRET"]
 )
 
-TRUSTED_ACCOUNTS = [
+OFFICIAL_CHANNELS = [
+    "securebordersuk", "citimmcanada", "uscis", "ausgov_homeaffairs",
+    "homeoffice", "borderforce", "govuk"
+]
+
+NEWS_CHANNELS = [
     "bbc", "bbcnews", "cnn", "skynews", "itvnews",
     "channel4news", "guardiannews", "independent",
     "reuters", "apnews", "gbnews", "dwnews", "timesradio",
     "washingtonpost", "nbcnews", "cbsnews", "nytimes", "abcnews",
     "cbcnews", "ctvnews", "globalnews", "abcnews_au", "skynews_au",
     "7news", "9news", "euronews", "france24"
+]
+
+EXPERT_CHANNELS = [
+    "theimmigrationlawyer", "immigrationshop", "studyportals",
+    "idp-education", "qs_world_university_rankings"
 ]
 
 
@@ -158,7 +168,7 @@ def get_immigration_news(used_headlines=None):
                 )
             }
         ]
-    }
+    }Amazing. We are making very good headways. Thank you. Now I want it to prioritize Official Channels and only fall back to the most viewed channel if the official channel doesn't have it. So if there is a topic that it's working on, is your first search there.
 
     r = requests.post(
         "https://api.perplexity.ai/chat/completions",
@@ -210,26 +220,37 @@ def search_tiktok(keyword, seen_urls, seen_ids):
     if not results:
         return None
 
-    trusted, others = [], []
+    official, news, expert, others = [], [], [], []
     for video in results:
         url = normalise_url(video.get("webVideoUrl", ""))
-        # Resolve shortened links so we can always extract the video ID
         url = resolve_short_url(url)
         vid = extract_video_id(url)
         if not url:
             continue
         if url in seen_urls or (vid and vid in seen_ids):
             continue
+
         author = (video.get("authorMeta", {}).get("name", "") or "").lower()
-        if any(t in author for t in TRUSTED_ACCOUNTS):
-            trusted.append(video)
+        handle = (video.get("authorMeta", {}).get("uniqueId", "") or "").lower()
+
+        if any(t in author or t in handle for t in OFFICIAL_CHANNELS):
+            official.append(video)
+        elif any(t in author or t in handle for t in NEWS_CHANNELS):
+            news.append(video)
+        elif any(t in author or t in handle for t in EXPERT_CHANNELS):
+            expert.append(video)
         else:
             others.append(video)
 
-    trusted.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
-    others.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
+    # Sort each tier by play count (most viewed first)
+    for bucket in [official, news, expert, others]:
+        bucket.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
 
-    return trusted[0] if trusted else (others[0] if others else None)
+    # Priority selection
+    if official: return official[0]
+    if news: return news[0]
+    if expert: return expert[0]
+    return others[0] if others else None
 
 
 def download_video(video):
@@ -375,15 +396,21 @@ def run_pipeline():
 
         tmp_path = download_video(video)  # passes full dict now
         cloudinary_url = upload_to_cloudinary(tmp_path)
-        write_to_sheet(headline, summary, caption, cloudinary_url, author, tiktok_url, video_id)
+
+        # Automatically credit the source in the caption
+        handle = video.get("authorMeta", {}).get("uniqueId", "unknown")
+        attributed_caption = f"{caption}\n\nSource: @{handle}"
+
+        write_to_sheet(headline, summary, attributed_caption, cloudinary_url, author, tiktok_url, video_id)
 
         return JSONResponse({
             "status": "success",
             "cloudinary_url": cloudinary_url,
-            "caption": caption,
+            "caption": attributed_caption,
             "headline": headline,
             "summary": summary,
             "tiktok_source": author,
+            "tiktok_handle": handle,
             "tiktok_url": tiktok_url,
             "video_id": video_id,
             "play_count": play_count
