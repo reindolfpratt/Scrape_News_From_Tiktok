@@ -1,20 +1,39 @@
+"""
+Immigration TikTok Pipeline - v3
+----------------------------------
+Architecture:
+- n8n reads Data Table, passes seen_ids to POST /run
+- Script scrapes curated TikTok accounts (no keyword search)
+- Caption generated from actual video description via DeepSeek
+- Returns JSON; n8n writes the row to Data Table
+
+n8n HTTP Request node config:
+  Method: POST
+  URL: http://<your-server>:8000/run
+  Body (JSON):
+    {
+      "seen_ids": ["123456789", "987654321", ...],
+      "seen_urls": ["https://www.tiktok.com/...", ...]
+    }
+"""
+
 import glob
 import os
 import re
 import time
-import concurrent.futures
 
 import cloudinary
 import cloudinary.uploader
 import requests
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Optional
 
 app = FastAPI()
 
 APIFY_API_KEY = os.environ["APIFY_API_KEY"]
-PERPLEXITY_API_KEY = os.environ["PERPLEXITY_API_KEY"]
-APPS_SCRIPT_URL = os.environ["APPS_SCRIPT_URL"]
+DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 
 cloudinary.config(
     cloud_name=os.environ["CLOUDINARY_CLOUD_NAME"],
@@ -22,24 +41,71 @@ cloudinary.config(
     api_secret=os.environ["CLOUDINARY_API_SECRET"]
 )
 
-TRUSTED_ACCOUNTS = [
-    "bbc", "bbcnews", "cnn", "skynews", "itvnews",
-    "channel4news", "guardiannews", "independent",
-    "reuters", "apnews", "gbnews", "dwnews", "timesradio"
+# ---------------------------------------------------------------------------
+# Curated immigration TikTok accounts
+# Add more usernames here any time — no code changes needed elsewhere
+# ---------------------------------------------------------------------------
+IMMIGRATION_ACCOUNTS = [
+    # --- UK & Europe ---
+    "theimmigrationlawyer",      # UK immigration lawyer, very active
+    "immigration_solicitors",    # UK immigration solicitors London
+    "gbnews",                    # GB News (UK immigration coverage)
+    "itvnews",                   # ITV News
+    "itvpolitics",               # ITV Politics
+    "bbcnews",                   # BBC News
+    "skynews",                   # Sky News
+    "c4news",                    # Channel 4 News
+    "youngeuropeans",            # European mobility & immigration news
+
+    # --- Canada ---
+    "gloriaofcanada",            # Canadian immigration creator, large following
+    "immigrationnewscanada",     # Immigration News Canada (INC) — 244K followers
+    "canadianimmlawyer",         # Paul, Canadian immigration lawyer — 172K followers
+    "srimmigrationsolutions",    # Sri immigration solutions
+    "moving2canadatok",          # Moving to Canada content
+    "visaplaceimmigration",      # VisaPlace Canada
+    "immigration.tips",          # Alex Canadian Lawyer
+    "cadimmigrationlawyer",      # Jatin Shory — Canadian immigration lawyer
+    "canadaimmigrationnewz",     # Canada immigration news
+    "crossbridgeimmigration",    # Crossbridge Immigration Canada
+    "gpsinghimmigration",        # GP Singh Immigration Canada
+    "theimmigrationpro",         # Shelina, Pirani Immigration Canada
+    "osmiumimmigration",         # Gurpreet Kaur RCIC Canada
+    "mworldimmigration",         # M World Immigration Canada
+    "todmaffin",                 # Canadian news/immigration commentary
+
+    # --- USA ---
+    "themigrantchannel",         # US migration & immigration news channel
+    "mcbeanlaw",                 # McBean Law — US immigration breaking news
+    "cbsnews",                   # CBS News
+    "immigration.abcs",          # Immigration ABCs (Scott Legal NYC)
+
+    # --- General / Multi-region ---
+    "aatlantis.facilit",         # Immigration facilitation content
 ]
 
 
-def normalise_url(url):
+# ---------------------------------------------------------------------------
+# Request model — n8n sends seen IDs/URLs so the script stays stateless
+# ---------------------------------------------------------------------------
+class RunRequest(BaseModel):
+    seen_ids: Optional[List[str]] = []
+    seen_urls: Optional[List[str]] = []
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+def normalise_url(url: str) -> str:
     return (url or "").split("?", 1)[0].rstrip("/")
 
 
-def extract_video_id(url):
+def extract_video_id(url: str) -> str:
     m = re.search(r"/video/(\d+)", url or "")
     return m.group(1) if m else ""
 
 
-def resolve_short_url(url):
-    """Follow redirects on shortened TikTok URLs to get the canonical URL."""
+def resolve_short_url(url: str) -> str:
     if not url or ("vm.tiktok" not in url and "vt.tiktok" not in url):
         return url
     try:
@@ -50,170 +116,49 @@ def resolve_short_url(url):
         return url
 
 
-def extract_keywords(text):
-    """Extract meaningful keywords from a headline for topic comparison."""
-    stop_words = {
-        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-        'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
-        'and', 'or', 'but', 'not', 'no', 'it', 'its', 'this', 'that',
-        'new', 'will', 'has', 'have', 'had', 'may', 'could',
-        'would', 'should', 'as', 'up', 'out', 'over', 'after', 'into',
-        'about', 'says', 'said', 'set', 'get', 'gets', 'got', 'more',
-        'what', 'how', 'why', 'when', 'who', 'which', 'their', 'they',
-        'plan', 'plans', 'update', 'latest', 'breaking', 'just', 'now',
-        'news', 'report', 'reports', 'announced', 'announces', 'amid',
+def is_immigration_related(text: str) -> bool:
+    """
+    Basic relevance filter — ensures we don't grab an off-topic video
+    from an account that occasionally posts non-immigration content.
+    """
+    keywords = {
+        "visa", "immigration", "immigrant", "migrants", "border",
+        "passport", "citizenship", "asylum", "refugee", "work permit",
+        "study permit", "student visa", "pr", "permanent resident",
+        "deportation", "ircc", "uscis", "home office", "uk visa",
+        "canada", "express entry", "points based", "settlement",
+        "skilled worker", "tier", "biometric", "eea", "brexit",
+        "right to remain", "leave to remain", "sponsorship", "iom",
     }
-    words = re.findall(r'[a-z]+', text.lower())
-    return set(w for w in words if w not in stop_words and len(w) > 2)
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in keywords)
 
 
-def detect_country(headline):
-    """Detect which country the headline is about using strict word boundaries."""
-    headline_lower = headline.lower()
-    country_keywords = {
-        "Canada": [r"\bcanada\b", r"\bcanadian\b", r"\bircc\b"],
-        "UK": [r"\buk\b", r"\bunited kingdom\b", r"\bbritain\b", r"\bbritish\b", r"\bhome office\b"],
-        "USA": [r"\busa\b", r"\bus\b", r"\bunited states\b", r"\bamerican\b", r"\bamerica\b", r"\brubio\b", r"\btrump\b", r"\buscis\b"],
-        "Australia": [r"\baustralia\b", r"\baustralian\b"],
-        "EU": [r"\beurope\b", r"\beuropean\b", r"\beu\b", r"\bschengen\b"]
-    }
-    for country, keywords in country_keywords.items():
-        if any(re.search(kw, headline_lower) for kw in keywords):
-            return country
-    return None
+# ---------------------------------------------------------------------------
+# Apify — scrape latest videos from curated account list
+# ---------------------------------------------------------------------------
+def scrape_accounts(accounts: List[str], videos_per_account: int = 5) -> List[dict]:
+    """
+    Use Apify's TikTok Profile Scraper to fetch the latest N videos
+    from each curated account.
+    """
+    run_url = f"https://api.apify.com/v2/acts/clockworks~tiktok-profile-scraper/runs?token={APIFY_API_KEY}"
 
-
-def is_duplicate_topic(new_headline, used_headlines, threshold=0.5):
-    """Return True if new_headline covers the same topic as any used headline."""
-    new_normalised = new_headline.strip().lower()
-    new_kw = extract_keywords(new_headline)
-
-    for old in used_headlines:
-        # Hard exact-match guard — catches Perplexity returning the identical headline
-        if old.strip().lower() == new_normalised:
-            return True
-        # Fuzzy keyword overlap
-        old_kw = extract_keywords(old)
-        if not new_kw or not old_kw:
-            continue
-        overlap = len(new_kw & old_kw) / min(len(new_kw), len(old_kw))
-        if overlap >= threshold:
-            return True
-    return False
-
-
-def get_posted_history():
-    max_retries = 3
-    rows = []
-
-    for attempt in range(max_retries):
-        try:
-            r = requests.get(APPS_SCRIPT_URL, timeout=20, allow_redirects=True)
-            r.raise_for_status()
-            # Validate we got JSON, not a redirect page
-            content_type = r.headers.get("Content-Type", "")
-            if "application/json" not in content_type:
-                raise Exception(f"Expected JSON, got {content_type}")
-            rows = r.json()
-            print(f"[INFO] Loaded {len(rows)} rows from history")
-            break
-        except Exception as e:
-            wait = 2 ** attempt  # exponential backoff: 1s, 2s, 4s
-            print(f"[WARN] History fetch attempt {attempt+1}/{max_retries} failed: {e}")
-            if attempt < max_retries - 1:
-                print(f"[INFO] Retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                print(f"[ERROR] All retries exhausted — ALL dedup is disabled this run")
-                return set(), set(), []
-
-    seen_urls, seen_ids, used_headlines = set(), set(), []
-    for row in rows:
-        u = normalise_url(str(row.get("tiktok_url", "") or ""))
-        v = str(row.get("video_id", "") or "").strip()
-        h = str(row.get("headline", "") or "").strip()
-        if u: seen_urls.add(u)
-        if v: seen_ids.add(v)
-        if h: used_headlines.append(h)
-
-    print(f"[DEBUG] used_headlines count: {len(used_headlines)}")
-    print(f"[DEBUG] First 3 headlines: {used_headlines[:3]}")
-
-    return seen_urls, seen_ids, used_headlines
-
-
-def get_immigration_news(used_headlines=None):
-    headers = {
-        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    exclusion = ""
-    if used_headlines:
-        all_topics = set()
-        for h in used_headlines:
-            all_topics.update(extract_keywords(h))
-        topic_str = ", ".join(sorted(all_topics)[:40])
-
-        exclusion = (
-            "\n\nCRITICAL — Do NOT suggest any of these stories OR any story on the same topic. "
-            "Each story below has ALREADY been covered:\n"
-            + "\n".join(f"- {h}" for h in used_headlines)
-            + f"\n\nAvoid stories involving these topics/keywords: {topic_str}"
-            + "\n\nYou MUST suggest a COMPLETELY DIFFERENT story that is not related to any of the above."
-        )
+    profiles = [f"https://www.tiktok.com/@{a}" for a in accounts]
 
     payload = {
-        "model": "sonar",
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a news assistant. Always reply in the exact format requested. No extra text, no markdown, no preamble. Never repeat a topic you have been told to avoid."
-            },
-            {
-                "role": "user",
-                "content": (
-                    "What is the most important UK, Canada, USA, Australia, or Europe immigration news story from the last 20 days? "
-                    "Reply in exactly this format and nothing else:\n"
-                    "HEADLINE: <headline>\n"
-                    "SUMMARY: <two sentence summary>\n"
-                    "CAPTION: <engaging Instagram caption with relevant emojis and hashtags>"
-                    + exclusion
-                )
-            }
-        ]
+        "profiles": profiles,
+        "maxPostsPerProfile": videos_per_account,
     }
 
-    r = requests.post(
-        "https://api.perplexity.ai/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=30
-    )
-    r.raise_for_status()
-    content = r.json()["choices"][0]["message"]["content"].strip()
-
-    headline, summary, caption = "", "", ""
-    for line in content.splitlines():
-        line = line.strip()
-        if line.startswith("HEADLINE:"):
-            headline = line.split("HEADLINE:", 1)[1].strip()
-        elif line.startswith("SUMMARY:"):
-            summary = line.split("SUMMARY:", 1)[1].strip()
-        elif line.startswith("CAPTION:"):
-            caption = line.split("CAPTION:", 1)[1].strip()
-
-    return headline, summary, caption
-
-
-def search_tiktok(keyword, seen_urls, seen_ids, headline_keywords=None, trusted_only=False):
-    run_url = f"https://api.apify.com/v2/acts/clockworks~tiktok-scraper/runs?token={APIFY_API_KEY}"
-    r = requests.post(run_url, json={"searchQueries": [keyword], "resultsPerPage": 15}, timeout=30)
+    print(f"[INFO] Scraping {len(accounts)} accounts, {videos_per_account} videos each")
+    r = requests.post(run_url, json=payload, timeout=30)
     r.raise_for_status()
     run_id = r.json()["data"]["id"]
 
+    # Poll until done (max ~6 minutes)
     run_info = None
-    for _ in range(36):
+    for _ in range(40):
         time.sleep(10)
         status_r = requests.get(
             f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_API_KEY}",
@@ -221,54 +166,102 @@ def search_tiktok(keyword, seen_urls, seen_ids, headline_keywords=None, trusted_
         )
         status_r.raise_for_status()
         run_info = status_r.json()["data"]
+        print(f"[INFO] Apify status: {run_info['status']}")
         if run_info["status"] == "SUCCEEDED":
             break
         if run_info["status"] in ["FAILED", "ABORTED", "TIMED-OUT"]:
-            raise Exception(f"Apify run failed: {run_info['status']}")
+            raise Exception(f"Apify profile scraper failed: {run_info['status']}")
 
     results = requests.get(
         f"https://api.apify.com/v2/datasets/{run_info['defaultDatasetId']}/items?token={APIFY_API_KEY}",
         timeout=15
     ).json()
 
-    if not results:
-        return None
+    print(f"[INFO] Got {len(results)} raw videos from Apify")
+    return results
 
-    trusted, others = [], []
-    for video in results:
+
+# ---------------------------------------------------------------------------
+# Pick the best unseen, relevant video
+# ---------------------------------------------------------------------------
+def pick_video(all_videos: List[dict], seen_ids: set, seen_urls: set) -> Optional[dict]:
+    candidates = []
+
+    for video in all_videos:
         url = normalise_url(video.get("webVideoUrl", ""))
         url = resolve_short_url(url)
         vid = extract_video_id(url)
-        if not url:
+
+        if not url or not vid:
             continue
-        if url in seen_urls or (vid and vid in seen_ids):
+
+        # Skip already-posted videos
+        if url in seen_urls or vid in seen_ids:
             continue
 
-        description = (video.get("text", "") or "").lower()
-        if headline_keywords:
-            video_kw = extract_keywords(description)
-            overlap = len(headline_keywords & video_kw)
-            min_match = min(2, len(headline_keywords))
-            if overlap < min_match:
-                continue
+        # Skip videos unrelated to immigration
+        description = video.get("text", "") or ""
+        if not is_immigration_related(description):
+            print(f"[SKIP] Not immigration-related: {description[:80]}")
+            continue
 
-        author = (video.get("authorMeta", {}).get("name", "") or "").lower()
-        if any(t in author for t in TRUSTED_ACCOUNTS):
-            trusted.append(video)
-        else:
-            others.append(video)
+        candidates.append(video)
 
-    trusted.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
-    others.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
+    if not candidates:
+        return None
 
-    # If trusted_only mode, only return trusted accounts
-    if trusted_only:
-        return trusted[0] if trusted else None
-
-    return trusted[0] if trusted else (others[0] if others else None)
+    # Sort by play count — highest first
+    candidates.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
+    chosen = candidates[0]
+    print(f"[INFO] Picked video: {chosen.get('webVideoUrl')} | plays: {chosen.get('playCount')}")
+    return chosen
 
 
-def download_video(video):
+# ---------------------------------------------------------------------------
+# DeepSeek — generate caption from the video's own description
+# ---------------------------------------------------------------------------
+def generate_caption(video_description: str, author: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    prompt = (
+        f"You are a social media manager for an international study abroad consultancy (Cohby Consult). "
+        f"Write an engaging Instagram Reels caption based on this TikTok video description:\n\n"
+        f"\"{video_description}\"\n\n"
+        f"Requirements:\n"
+        f"- 2-4 sentences max, energetic and informative\n"
+        f"- Include 4-6 relevant hashtags (immigration, study abroad, visa, destination country)\n"
+        f"- Use 1-2 relevant emojis\n"
+        f"- Do NOT include any source attribution, contact info, or URLs — those are added separately\n"
+        f"- Output ONLY the caption text, nothing else"
+    )
+
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 300,
+        "temperature": 0.7,
+    }
+
+    r = requests.post(
+        "https://api.deepseek.com/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+    r.raise_for_status()
+    caption = r.json()["choices"][0]["message"]["content"].strip()
+    return caption
+
+
+# ---------------------------------------------------------------------------
+# Download & upload
+# ---------------------------------------------------------------------------
+def download_video(video: dict) -> str:
     direct_url = (
         video.get("videoUrl")
         or video.get("downloadAddr")
@@ -295,13 +288,13 @@ def download_video(video):
                     f.write(chunk)
             if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 10000:
                 return tmp_path
-        except Exception:
-            pass  # fall through to yt-dlp
+        except Exception as e:
+            print(f"[WARN] Direct download failed: {e} — falling back to yt-dlp")
 
     return _ytdlp_download(normalise_url(video.get("webVideoUrl", "")))
 
 
-def _ytdlp_download(tiktok_url):
+def _ytdlp_download(tiktok_url: str) -> str:
     try:
         from yt_dlp import YoutubeDL
     except ImportError:
@@ -342,7 +335,7 @@ def _ytdlp_download(tiktok_url):
     return file_path
 
 
-def upload_to_cloudinary(file_path):
+def upload_to_cloudinary(file_path: str) -> str:
     result = cloudinary.uploader.upload(
         file_path,
         resource_type="video",
@@ -353,120 +346,79 @@ def upload_to_cloudinary(file_path):
     return result["secure_url"]
 
 
-def write_to_sheet(headline, summary, caption, cloudinary_url, tiktok_source, tiktok_url, video_id):
-    r = requests.post(APPS_SCRIPT_URL, json={
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "headline": headline,
-        "summary": summary,
-        "caption": caption,
-        "cloudinary_url": cloudinary_url,
-        "tiktok_source": tiktok_source,
-        "tiktok_url": tiktok_url,
-        "video_id": video_id
-    }, timeout=15)
-    r.raise_for_status()
-
-
-@app.get("/run")
-def run_pipeline():
+# ---------------------------------------------------------------------------
+# Main endpoint — called by n8n
+# ---------------------------------------------------------------------------
+@app.post("/run")
+def run_pipeline(body: RunRequest):
+    """
+    Called by n8n HTTP Request node (POST).
+    Expects: { "seen_ids": [...], "seen_urls": [...] }
+    Returns all fields needed for n8n Data Table insert.
+    """
     tmp_path = None
     try:
-        seen_urls, seen_ids, used_headlines = get_posted_history()
+        seen_ids = set(str(i).strip() for i in (body.seen_ids or []) if i)
+        seen_urls = set(str(u).strip() for u in (body.seen_urls or []) if u)
+        print(f"[INFO] Received {len(seen_ids)} seen IDs and {len(seen_urls)} seen URLs from n8n")
 
-        # Try up to 3 times to get a genuinely new topic
-        headline, summary, caption = "", "", ""
-        rejected = []
-        for attempt in range(3):
-            headline, summary, caption = get_immigration_news(used_headlines + rejected)
-            if not headline:
-                return JSONResponse({"status": "no_news", "message": "No immigration news found"})
+        # 1. Scrape all curated accounts
+        all_videos = scrape_accounts(IMMIGRATION_ACCOUNTS, videos_per_account=5)
+        if not all_videos:
+            return JSONResponse({"status": "no_videos", "message": "Apify returned no videos"})
 
-            if is_duplicate_topic(headline, used_headlines):
-                print(f"[INFO] Attempt {attempt+1}: Rejected duplicate topic: {headline}")
-                rejected.append(headline)
-                headline = ""
-                continue
-
-            print(f"[INFO] Accepted headline on attempt {attempt+1}: {headline}")
-            break
-
-        if not headline:
+        # 2. Pick best unseen, relevant video
+        video = pick_video(all_videos, seen_ids, seen_urls)
+        if not video:
             return JSONResponse({
-                "status": "no_fresh_topic",
-                "message": "Could not find a fresh news topic after 3 attempts",
-                "rejected": rejected
+                "status": "no_fresh_video",
+                "message": "All videos from curated accounts already posted or not immigration-related"
             })
 
-        headline_kw = extract_keywords(headline)
-        country = detect_country(headline)
-        print(f"[INFO] Detected country: {country or 'Unknown'}")
-
-        search_terms = sorted(list(headline_kw), key=len, reverse=True)[:4]
-        base_query = " ".join(search_terms)
-
-        # Execute Apify tasks in parallel to prevent 504 Gateway Timeouts on long sequential runs
-        print(f"[INFO] Firing Apify searches concurrently to prevent timeouts...")
-        fallback_query = f"{base_query} {country.lower()}" if country else base_query
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            future_trusted = executor.submit(search_tiktok, base_query, seen_urls, seen_ids, headline_kw, trusted_only=True)
-            future_fallback = executor.submit(search_tiktok, fallback_query, seen_urls, seen_ids, headline_kw, trusted_only=False)
-            future_base = executor.submit(search_tiktok, base_query, seen_urls, seen_ids, headline_kw, trusted_only=False) if country else future_fallback
-            
-            # Step 1: Check trusted first
-            video = future_trusted.result()
-            if video:
-                print(f"[INFO] Selected TRUSTED account for: {base_query}")
-                
-            # Step 2: Fall back to country-specific search
-            if not video and country:
-                video = future_fallback.result()
-                if video:
-                    print(f"[INFO] Selected COUNTRY FALLBACK video: {fallback_query}")
-
-            # Step 3: Last resort - base generic search
-            if not video:
-                video = future_base.result()
-                if video:
-                    print(f"[INFO] Selected LAST RESORT video: {base_query}")
-
-        if not video:
-            return JSONResponse({"status": "no_fresh_video", "message": "No relevant unseen TikTok video found for this topic"})
-
-        author_meta = video.get("authorMeta", {}) or {}
-        handle = author_meta.get("uniqueId") or author_meta.get("nickName") or "unknown"
+        # 3. Extract metadata
+        author = (video.get("authorMeta", {}).get("name", "") or "unknown").strip()
         tiktok_url = normalise_url(video.get("webVideoUrl", ""))
         video_id = extract_video_id(tiktok_url)
         play_count = int(video.get("playCount") or 0)
+        video_description = (video.get("text", "") or "").strip()
 
-        if not tiktok_url:
-            return JSONResponse({"status": "no_video_url", "message": "No usable TikTok URL on selected video"})
+        print(f"[INFO] Selected @{author} | ID: {video_id} | plays: {play_count}")
+        print(f"[INFO] Description: {video_description[:120]}")
 
-        tmp_path = download_video(video)
-        cloudinary_url = upload_to_cloudinary(tmp_path)
+        if not tiktok_url or not video_id:
+            return JSONResponse({"status": "no_video_url", "message": "No usable TikTok URL"})
 
-        # FIX: inject TikTok source and contact into caption with @handle format
-        caption_with_contact = (
-            f"{caption}\n\n"
-            f"TikTok source: @{handle}\n"
+        # 4. Generate caption from the actual video description (no more Perplexity mismatch)
+        raw_caption = generate_caption(video_description, author)
+
+        # 5. Append attribution footer
+        full_caption = (
+            f"{raw_caption}\n\n"
+            f"TikTok source: {author}\n"
             f"Contact us: www.cohbyconsult.com"
         )
 
-        write_to_sheet(headline, summary, caption_with_contact, cloudinary_url, f"@{handle}", tiktok_url, video_id)
+        # 6. Download + upload to Cloudinary
+        tmp_path = download_video(video)
+        cloudinary_url = upload_to_cloudinary(tmp_path)
 
+        # 7. Return everything — n8n handles the Data Table write
         return JSONResponse({
             "status": "success",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "headline": video_description[:200],
+            "summary": video_description,
+            "caption": full_caption,
             "cloudinary_url": cloudinary_url,
-            "caption": caption_with_contact,
-            "headline": headline,
-            "summary": summary,
-            "tiktok_source": f"@{handle}",
+            "tiktok_source": author,
             "tiktok_url": tiktok_url,
             "video_id": video_id,
-            "play_count": play_count
+            "play_count": play_count,
         })
 
     except Exception as e:
+        import traceback
+        print(f"[ERROR] {e}\n{traceback.format_exc()}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
     finally:
@@ -474,6 +426,20 @@ def run_pipeline():
             os.remove(tmp_path)
 
 
+@app.get("/run")
+def run_pipeline_get():
+    return JSONResponse({
+        "message": "Use POST /run with body: {seen_ids: [], seen_urls: []}. "
+                   "n8n should call this via HTTP Request node (POST)."
+    })
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "accounts": len(IMMIGRATION_ACCOUNTS)}
+
+
+@app.get("/accounts")
+def list_accounts():
+    """Check which accounts are in rotation."""
+    return {"count": len(IMMIGRATION_ACCOUNTS), "accounts": IMMIGRATION_ACCOUNTS}
