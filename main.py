@@ -417,6 +417,8 @@ def run_pipeline():
         tmp_path = download_video(video)  # passes full dict now
         cloudinary_url = upload_to_cloudinary(tmp_path)
 
+        handle = video.get("authorMeta", {}).get("uniqueId", "unknown")
+        
         # Updated branding for the caption
         attributed_caption = (
             f"{caption}\n\n"
