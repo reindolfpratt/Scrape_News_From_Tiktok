@@ -83,7 +83,7 @@ def get_immigration_news(used_headlines=None):
             {
                 "role": "user",
                 "content": (
-                    "What is the single most important UK immigration news story from the last 20 days? "
+                    "What is the most important UK, Canada, USA, Australia, or Europe immigration news story from the last 20 days? "
                     "Reply in exactly this format and nothing else:\n"
                     "HEADLINE: <headline>\n"
                     "SUMMARY: <two sentence summary>\n"
@@ -275,7 +275,7 @@ def run_pipeline():
         if not headline:
             return JSONResponse({"status": "no_news", "message": "No immigration news found"})
 
-        video = search_tiktok(f"UK immigration {headline[:60]}", seen_urls, seen_ids)
+        video = search_tiktok(f"immigration {headline[:60]}", seen_urls, seen_ids)
         if not video:
             return JSONResponse({"status": "no_fresh_video", "message": "No new unseen TikTok video found"})
 
@@ -289,7 +289,10 @@ def run_pipeline():
 
         tmp_path = download_video(video)  # passes full dict now
         cloudinary_url = upload_to_cloudinary(tmp_path)
-        write_to_sheet(headline, summary, caption, cloudinary_url, author, tiktok_url, video_id)
+        
+        caption_with_contact = f"{caption}\n\nContact us: www.cohbyconsult.com"
+        
+        write_to_sheet(headline, summary, caption_with_contact, cloudinary_url, author, tiktok_url, video_id)
 
         return JSONResponse({
             "status": "success",
