@@ -1,5 +1,3 @@
-fastapi
-uvicorn
+yt-dlp
 requests
 cloudinary
-yt-dlp
