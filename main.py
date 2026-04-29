@@ -34,7 +34,6 @@ from typing import List, Optional
 
 app = FastAPI()
 
-APIFY_API_KEY = os.environ["APIFY_API_KEY"]
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 
 cloudinary.config(
@@ -257,43 +256,47 @@ def generate_caption(video_description: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Apify — scrape latest videos from curated account list
+
 # ---------------------------------------------------------------------------
-def scrape_accounts(accounts: List[str], videos_per_account: int = 5) -> List[dict]:
-    run_url = f"https://api.apify.com/v2/acts/clockworks~tiktok-profile-scraper/runs?token={APIFY_API_KEY}"
-    profiles = [f"https://www.tiktok.com/@{a}" for a in accounts]
-    payload = {
-        "profiles": profiles,
-        "maxPostsPerProfile": videos_per_account,
+def scrape_accounts(accounts: List[str], videos_per_account: int = 10) -> List[dict]:
+    from yt_dlp import YoutubeDL
+
+    all_videos = []
+
+    ydl_opts = {
+        "quiet": True,
+        "noprogress": True,
+        "skip_download": True,
+        "playlistend": videos_per_account,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        },
     }
 
-    print(f"[INFO] Scraping {len(accounts)} accounts, {videos_per_account} videos each")
-    r = requests.post(run_url, json=payload, timeout=30)
-    r.raise_for_status()
-    run_id = r.json()["data"]["id"]
+    for account in accounts:
+        url = f"https://www.tiktok.com/@{account}"
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                entries = info.get("entries", []) if info else []
+                for entry in entries:
+                    if not entry:
+                        continue
+                    all_videos.append({
+                        "webVideoUrl": entry.get("webpage_url", ""),
+                        "text": entry.get("description", ""),
+                        "playCount": entry.get("view_count", 0),
+                        "diggCount": entry.get("like_count", 0),
+                        "videoUrl": entry.get("url", ""),
+                        "authorMeta": {"name": account},
+                    })
+                print(f"[INFO] @{account}: {len(entries)} videos fetched")
+        except Exception as e:
+            print(f"[WARN] Failed to scrape @{account}: {e}")
+            continue
 
-    run_info = None
-    for _ in range(40):
-        time.sleep(10)
-        status_r = requests.get(
-            f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_API_KEY}",
-            timeout=15
-        )
-        status_r.raise_for_status()
-        run_info = status_r.json()["data"]
-        print(f"[INFO] Apify status: {run_info['status']}")
-        if run_info["status"] == "SUCCEEDED":
-            break
-        if run_info["status"] in ["FAILED", "ABORTED", "TIMED-OUT"]:
-            raise Exception(f"Apify profile scraper failed: {run_info['status']}")
-
-    results = requests.get(
-        f"https://api.apify.com/v2/datasets/{run_info['defaultDatasetId']}/items?token={APIFY_API_KEY}",
-        timeout=15
-    ).json()
-
-    print(f"[INFO] Got {len(results)} raw videos from Apify")
-    return results
+    print(f"[INFO] Total videos fetched: {len(all_videos)}")
+    return all_videos
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +450,7 @@ def run_pipeline(body: RunRequest):
         # 1. Scrape all curated accounts
         all_videos = scrape_accounts(NEWS_ACCOUNTS, videos_per_account=10)
         if not all_videos:
-            return JSONResponse({"status": "no_videos", "message": "Apify returned no videos"})
+            return JSONResponse({"status": "no_videos", "message": "yt-dlp returned no videos"})
 
         # 2. Pick best unseen, important, non-duplicate video
         video = pick_video(all_videos, seen_ids, seen_urls, recent_summaries)
