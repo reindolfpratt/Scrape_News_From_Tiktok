@@ -127,10 +127,9 @@ def is_important_news_ai(description: str) -> bool:
         prompt = (
             "You are a news importance classifier. "
             "Read the following TikTok video description from a trusted news media account. "
-            "Answer with ONE word only: YES if this is important general news "
-            "(politics, economy, conflict, disaster, major world events, breaking news, science breakthroughs, health crises). "
-            "Answer NO if it is sport, entertainment, celebrity gossip, lifestyle, "
-            "cooking, fashion, travel tips, or any non-news content.\n\n"
+            "Answer with ONE word only: YES if this is BREAKING NEWS only "
+            "(developing stories, urgent events, major disasters, sudden political crises, terror attacks, major conflict escalations). "
+            "Answer NO if it is anything else — including regular news, analysis, opinion, features, sport, entertainment or lifestyle.\n\n "
             f"Description: \"{description[:500]}\""
         )
         payload = {
