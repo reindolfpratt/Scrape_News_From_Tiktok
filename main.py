@@ -1,40 +1,26 @@
 """
-General News TikTok Pipeline - v1
-----------------------------------
-Architecture:
-- n8n reads Data Table, passes seen_ids to POST /run
-- Script scrapes curated trusted news TikTok accounts (no keyword search)
-- Filters for important general news only via DeepSeek AI gate
+General News TikTok Pipeline - GitHub Actions Edition
+------------------------------------------------------
+- Runs on a cron schedule via GitHub Actions
+- Scrapes trusted news TikTok accounts via yt-dlp
+- Filters for important general news via DeepSeek AI gate
 - Minimum 1,000 views/likes threshold
-- Caption generated from video description via DeepSeek (clean, brand-neutral)
-- Returns JSON; n8n writes the row to Data Table
-
-n8n HTTP Request node config:
-  Method: POST
-  URL: http://<your-server>:8000/run
-  Body (JSON):
-    {
-      "seen_ids": ["123456789", "987654321", ...],
-      "seen_urls": ["https://www.tiktok.com/...", ...]
-    }
+- Generates caption via DeepSeek
+- Uploads to Cloudinary
+- POSTs result to n8n webhook
 """
 
-import glob
 import os
 import re
+import glob
 import time
-
+import requests
 import cloudinary
 import cloudinary.uploader
-import requests
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from typing import List, Optional
 
-app = FastAPI()
-
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
+N8N_WEBHOOK_URL = os.environ["N8N_WEBHOOK_URL"]
 
 cloudinary.config(
     cloud_name=os.environ["CLOUDINARY_CLOUD_NAME"],
@@ -42,73 +28,60 @@ cloudinary.config(
     api_secret=os.environ["CLOUDINARY_API_SECRET"]
 )
 
-# ---------------------------------------------------------------------------
-# Curated trusted news TikTok accounts — major media only, no personal pages
-# ---------------------------------------------------------------------------
 NEWS_ACCOUNTS = [
     # --- UK ---
-    "bbcnews",           # BBC News
-    "bbcworldservice",   # BBC World Service
-    "skynews",           # Sky News
-    "itvnews",           # ITV News
-    "c4news",            # Channel 4 News
-    "theguardian",       # The Guardian
-    "thetimes",          # The Times
-    "standardnews",      # Evening Standard
-    "telegraphnews",     # The Telegraph
+    "bbcnews",
+    "bbcworldservice",
+    "skynews",
+    "itvnews",
+    "c4news",
+    "theguardian",
+    "thetimes",
+    "standardnews",
+    "telegraphnews",
 
     # --- USA ---
-    "cnn",               # CNN
-    "cbsnews",           # CBS News
-    "abcnews",           # ABC News
-    "nbcnews",           # NBC News
-    "foxnews",           # Fox News
-    "reuters",           # Reuters
-    "apnews",            # Associated Press
-    "nprnews",           # NPR News
-    "washingtonpost",    # Washington Post
-    "nytimes",           # New York Times
-    "thehill",           # The Hill
-    "politico",          # Politico
-    "axios",             # Axios
+    "cnn",
+    "cbsnews",
+    "abcnews",
+    "nbcnews",
+    "foxnews",
+    "reuters",
+    "apnews",
+    "nprnews",
+    "washingtonpost",
+    "nytimes",
+    "thehill",
+    "politico",
+    "axios",
 
     # --- Canada ---
-    "cbcnews",           # CBC News
-    "globalnews",        # Global News
-    "ctvnews",           # CTV News
-    "torontostar",       # Toronto Star
+    "cbcnews",
+    "globalnews",
+    "ctvnews",
+    "torontostar",
 
     # --- Australia ---
-    "abcaustralia",      # ABC Australia
-    "skynewsaustralia",  # Sky News Australia
-    "9newsaus",          # 9News Australia
-    "7newsaustralia",    # 7News Australia
-    "theaustralian",     # The Australian
+    "abcaustralia",
+    "9newsaus",
+    "7newsaustralia",
+    "theaustralian",
 
     # --- New Zealand ---
-    "rnz_news",          # RNZ (Radio New Zealand)
-    "1newsnz",           # 1News NZ
-    "stuffnz",           # Stuff NZ
-    "nzherald",          # NZ Herald
+    "rnz_news",
+    "1newsnz",
+    "stuffnz",
+    "nzherald",
 
     # --- International ---
-    "aljazeera",         # Al Jazeera English
-    "dwnews",            # Deutsche Welle
-    "france24english",   # France 24 English
-    "euronews",          # Euronews
-    "trtworld",          # TRT World
+    "aljazeera",
+    "dwnews",
+    "france24english",
+    "euronews",
+    "trtworld",
 ]
 
-MIN_ENGAGEMENT = 1000  # Minimum views OR likes to qualify
-
-
-# ---------------------------------------------------------------------------
-# Request model
-# ---------------------------------------------------------------------------
-class RunRequest(BaseModel):
-    seen_ids: Optional[List[str]] = []
-    seen_urls: Optional[List[str]] = []
-    recent_summaries: Optional[List[str]] = []
+MIN_ENGAGEMENT = 1000
 
 
 # ---------------------------------------------------------------------------
@@ -140,11 +113,10 @@ def meets_engagement_threshold(video: dict) -> bool:
     return play_count >= MIN_ENGAGEMENT or like_count >= MIN_ENGAGEMENT
 
 
+# ---------------------------------------------------------------------------
+# DeepSeek helpers
+# ---------------------------------------------------------------------------
 def is_important_news_ai(description: str) -> bool:
-    """
-    DeepSeek AI gate — confirms the video is important general news.
-    Falls back to True on API errors to avoid blocking on outage.
-    """
     if not description or not description.strip():
         return False
     try:
@@ -169,13 +141,11 @@ def is_important_news_ai(description: str) -> bool:
         }
         r = requests.post(
             "https://api.deepseek.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=15,
+            headers=headers, json=payload, timeout=15
         )
         r.raise_for_status()
         answer = r.json()["choices"][0]["message"]["content"].strip().upper()
-        print(f"[AI GATE] DeepSeek says: {answer} | {description[:60]}")
+        print(f"[AI GATE] {answer} | {description[:60]}")
         return answer.startswith("YES")
     except Exception as e:
         print(f"[WARN] AI gate failed ({e}), allowing through")
@@ -183,10 +153,6 @@ def is_important_news_ai(description: str) -> bool:
 
 
 def is_duplicate_topic_ai(description: str, recent_summaries: List[str]) -> bool:
-    """
-    Duplicate topic check — skips if same core story already posted recently.
-    Falls back to False on API errors (allow through rather than block).
-    """
     if not recent_summaries:
         return False
     try:
@@ -210,13 +176,11 @@ def is_duplicate_topic_ai(description: str, recent_summaries: List[str]) -> bool
         }
         r = requests.post(
             "https://api.deepseek.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=15,
+            headers=headers, json=payload, timeout=15
         )
         r.raise_for_status()
         answer = r.json()["choices"][0]["message"]["content"].strip().upper()
-        print(f"[DUPE CHECK] DeepSeek says: {answer} | {description[:60]}")
+        print(f"[DUPE CHECK] {answer} | {description[:60]}")
         return answer.startswith("YES")
     except Exception as e:
         print(f"[WARN] Duplicate check failed ({e}), allowing through")
@@ -247,22 +211,19 @@ def generate_caption(video_description: str) -> str:
     }
     r = requests.post(
         "https://api.deepseek.com/v1/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=30,
+        headers=headers, json=payload, timeout=30
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
 
 
 # ---------------------------------------------------------------------------
-
+# yt-dlp scraper
 # ---------------------------------------------------------------------------
 def scrape_accounts(accounts: List[str], videos_per_account: int = 10) -> List[dict]:
     from yt_dlp import YoutubeDL
 
     all_videos = []
-
     ydl_opts = {
         "quiet": True,
         "noprogress": True,
@@ -300,11 +261,10 @@ def scrape_accounts(accounts: List[str], videos_per_account: int = 10) -> List[d
 
 
 # ---------------------------------------------------------------------------
-# Pick the best unseen, important, non-duplicate video
+# Pick best video
 # ---------------------------------------------------------------------------
-def pick_video(all_videos: List[dict], seen_ids: set, seen_urls: set, recent_summaries: List[str] = None) -> Optional[dict]:
+def pick_video(all_videos: List[dict], seen_ids: set, seen_urls: set, recent_summaries: List[str]) -> Optional[dict]:
     candidates = []
-    recent_summaries = recent_summaries or []
 
     for video in all_videos:
         url = normalise_url(video.get("webVideoUrl", ""))
@@ -313,26 +273,19 @@ def pick_video(all_videos: List[dict], seen_ids: set, seen_urls: set, recent_sum
 
         if not url or not vid:
             continue
-
-        # Skip already-posted
         if url in seen_urls or vid in seen_ids:
             continue
-
-        # Layer 1: Engagement threshold (>=1,000 views or likes)
         if not meets_engagement_threshold(video):
-            print(f"[SKIP] Below engagement threshold: plays={video.get('playCount')} likes={video.get('diggCount')}")
+            print(f"[SKIP] Below threshold: plays={video.get('playCount')} likes={video.get('diggCount')}")
             continue
 
         description = (video.get("text", "") or "").strip()
 
-        # Layer 2: DeepSeek AI gate — important news only
         if not is_important_news_ai(description):
-            print(f"[SKIP] AI gate rejected (not important news): {description[:80]}")
+            print(f"[SKIP] Not important news: {description[:80]}")
             continue
-
-        # Layer 3: Duplicate topic check
         if is_duplicate_topic_ai(description, recent_summaries):
-            print(f"[SKIP] Duplicate topic rejected: {description[:80]}")
+            print(f"[SKIP] Duplicate topic: {description[:80]}")
             continue
 
         candidates.append(video)
@@ -340,10 +293,9 @@ def pick_video(all_videos: List[dict], seen_ids: set, seen_urls: set, recent_sum
     if not candidates:
         return None
 
-    # Sort by play count — highest first
     candidates.sort(key=lambda x: x.get("playCount") or 0, reverse=True)
     chosen = candidates[0]
-    print(f"[INFO] Picked video: {chosen.get('webVideoUrl')} | plays: {chosen.get('playCount')}")
+    print(f"[INFO] Picked: {chosen.get('webVideoUrl')} | plays: {chosen.get('playCount')}")
     return chosen
 
 
@@ -355,7 +307,6 @@ def download_video(video: dict) -> str:
         video.get("videoUrl")
         or video.get("downloadAddr")
         or (video.get("videoMeta") or {}).get("downloadAddr")
-        or (video.get("videoMeta") or {}).get("originalDownloadAddr")
     )
 
     tmp_path = f"/tmp/general_news_{int(time.time())}.mp4"
@@ -384,10 +335,7 @@ def download_video(video: dict) -> str:
 
 
 def _ytdlp_download(tiktok_url: str) -> str:
-    try:
-        from yt_dlp import YoutubeDL
-    except ImportError:
-        raise Exception("yt-dlp not installed. Run: pip install yt-dlp")
+    from yt_dlp import YoutubeDL
 
     outtmpl = f"/tmp/general_news_{int(time.time())}.%(ext)s"
     ydl_opts = {
@@ -419,7 +367,7 @@ def _ytdlp_download(tiktok_url: str) -> str:
     if not os.path.exists(file_path):
         raise Exception("Video file not found after download")
     if os.path.getsize(file_path) < 10000:
-        raise Exception("Downloaded file too small — not a valid video")
+        raise Exception("Downloaded file too small")
 
     return file_path
 
@@ -436,88 +384,81 @@ def upload_to_cloudinary(file_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main endpoint — called by n8n
+# Main
 # ---------------------------------------------------------------------------
-@app.post("/run")
-def run_pipeline(body: RunRequest):
-    tmp_path = None
+def main():
+    # 1. Fetch seen IDs/URLs and recent summaries from n8n webhook
+    # n8n sends these via a separate GET webhook you set up (see below)
+    seen_ids = set()
+    seen_urls = set()
+    recent_summaries = []
+
     try:
-        seen_ids = set(str(i).strip() for i in (body.seen_ids or []) if i)
-        seen_urls = set(str(u).strip() for u in (body.seen_urls or []) if u)
-        recent_summaries = [str(s).strip() for s in (body.recent_summaries or []) if s]
-        print(f"[INFO] Received {len(seen_ids)} seen IDs, {len(seen_urls)} seen URLs, {len(recent_summaries)} recent summaries")
-
-        # 1. Scrape all curated accounts
-        all_videos = scrape_accounts(NEWS_ACCOUNTS, videos_per_account=10)
-        if not all_videos:
-            return JSONResponse({"status": "no_videos", "message": "yt-dlp returned no videos"})
-
-        # 2. Pick best unseen, important, non-duplicate video
-        video = pick_video(all_videos, seen_ids, seen_urls, recent_summaries)
-        if not video:
-            return JSONResponse({
-                "status": "no_fresh_video",
-                "message": "No fresh important news videos found across all accounts"
-            })
-
-        # 3. Extract metadata
-        author = (video.get("authorMeta", {}).get("name", "") or "unknown").strip()
-        tiktok_url = normalise_url(video.get("webVideoUrl", ""))
-        video_id = extract_video_id(tiktok_url)
-        play_count = int(video.get("playCount") or 0)
-        like_count = int(video.get("diggCount") or 0)
-        video_description = (video.get("text", "") or "").strip()
-
-        print(f"[INFO] Selected @{author} | ID: {video_id} | plays: {play_count} | likes: {like_count}")
-
-        if not tiktok_url or not video_id:
-            return JSONResponse({"status": "no_video_url", "message": "No usable TikTok URL"})
-
-        # 4. Generate caption from video description
-        caption = generate_caption(video_description)
-
-        # 5. Download + upload to Cloudinary
-        tmp_path = download_video(video)
-        cloudinary_url = upload_to_cloudinary(tmp_path)
-
-        # 6. Return everything — n8n handles the Data Table write
-        return JSONResponse({
-            "status": "success",
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "headline": video_description[:200],
-            "summary": video_description,
-            "caption": caption,
-            "cloudinary_url": cloudinary_url,
-            "tiktok_source": author,
-            "tiktok_url": tiktok_url,
-            "video_id": video_id,
-            "play_count": play_count,
-            "like_count": like_count,
-        })
-
+        resp = requests.get(
+            os.environ["N8N_DATA_FETCH_URL"],
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        seen_ids = set(str(i) for i in data.get("seen_ids", []) if i)
+        seen_urls = set(str(u) for u in data.get("seen_urls", []) if u)
+        recent_summaries = [str(s) for s in data.get("recent_summaries", []) if s]
+        print(f"[INFO] Fetched {len(seen_ids)} seen IDs, {len(seen_urls)} seen URLs")
     except Exception as e:
-        import traceback
-        print(f"[ERROR] {e}\n{traceback.format_exc()}")
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+        print(f"[WARN] Could not fetch seen data ({e}), proceeding with empty sets")
 
+    # 2. Scrape accounts
+    all_videos = scrape_accounts(NEWS_ACCOUNTS, videos_per_account=10)
+    if not all_videos:
+        print("[INFO] No videos fetched — exiting")
+        return
+
+    # 3. Pick best video
+    video = pick_video(all_videos, seen_ids, seen_urls, recent_summaries)
+    if not video:
+        print("[INFO] No fresh important news video found — exiting")
+        return
+
+    # 4. Extract metadata
+    author = (video.get("authorMeta", {}).get("name", "") or "unknown").strip()
+    tiktok_url = normalise_url(video.get("webVideoUrl", ""))
+    video_id = extract_video_id(tiktok_url)
+    play_count = int(video.get("playCount") or 0)
+    like_count = int(video.get("diggCount") or 0)
+    video_description = (video.get("text", "") or "").strip()
+
+    print(f"[INFO] Selected @{author} | ID: {video_id} | plays: {play_count}")
+
+    # 5. Generate caption
+    caption = generate_caption(video_description)
+
+    # 6. Download + upload
+    tmp_path = download_video(video)
+    try:
+        cloudinary_url = upload_to_cloudinary(tmp_path)
     finally:
-        if tmp_path and os.path.exists(tmp_path):
+        if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+    # 7. POST result to n8n webhook
+    payload = {
+        "status": "success",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "headline": video_description[:200],
+        "summary": video_description,
+        "caption": caption,
+        "cloudinary_url": cloudinary_url,
+        "tiktok_source": author,
+        "tiktok_url": tiktok_url,
+        "video_id": video_id,
+        "play_count": play_count,
+        "like_count": like_count,
+    }
 
-@app.get("/run")
-def run_pipeline_get():
-    return JSONResponse({
-        "message": "Use POST /run with body: {seen_ids: [], seen_urls: []}. "
-                   "n8n should call this via HTTP Request node (POST)."
-    })
+    r = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=30)
+    r.raise_for_status()
+    print(f"[INFO] Posted to n8n webhook — status: {r.status_code}")
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "accounts": len(NEWS_ACCOUNTS)}
-
-
-@app.get("/accounts")
-def list_accounts():
-    return {"count": len(NEWS_ACCOUNTS), "accounts": NEWS_ACCOUNTS}
+if __name__ == "__main__":
+    main()
